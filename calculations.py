@@ -1,4 +1,4 @@
-"""Calculations for the currency exchange agent."""
+"""Calculations for the currency exchange agent: API, cleaning, SQL, rules and tests."""
 
 import json
 import sqlite3
@@ -9,16 +9,20 @@ import pandas as pd
 import requests
 
 
+
+# 1. Custom error raised when exchange-rate data is missing
 class RateError(ValueError):
     pass
 
 
+# 2. Save the user's settings to config.json
 def save_settings(settings):
     file = open("config.json", "w")
     json.dump(settings, file, indent=4)
     file.close()
 
 
+# 3. Load user's settings 
 def load_settings():
     defaults = {
         "url": "https://api.frankfurter.dev/v2/rates",
@@ -38,6 +42,7 @@ def load_settings():
     except FileNotFoundError:
         settings = {}
 
+    # Add any setting that is missing
     changed = False
     for key in defaults:
         if key not in settings:
@@ -49,7 +54,10 @@ def load_settings():
 
     return settings
 
-
+# 4. Get data from the API (try again if it fails, up to 3 times)
+# get_request is normally requests.get. The tests swap in a fake
+# function that fails on purpose (a "mock"), so we can test errors
+# without switching off the Wi-Fi.
 def fetch_with_retry(url, params, retries=3, get_request=requests.get):
     """Call the API and return a list of records, or [] if it fails."""
     for attempt in range(1, retries + 1):
@@ -92,24 +100,30 @@ def fetch_with_retry(url, params, retries=3, get_request=requests.get):
     return []
 
 
+# 5. Check one record from the API
 def validate_record(record):
-    """Return True if a record has valid keys, types and values."""
+    """Return True if a record has the right keys, types and sensible values."""
+    # Each record must be a dictionary
     if type(record) != dict:
         return False
 
+    # All four keys must be there
     for key in ["date", "base", "quote", "rate"]:
         if key not in record:
             return False
 
+    # The date must be a real date like 2026-01-10
     date = pd.to_datetime(record["date"], format="%Y-%m-%d", errors="coerce")
     if pd.isna(date):
         return False
 
+    # Currency codes must be 3 letters, like AED
     for key in ["base", "quote"]:
         code = str(record[key])
         if len(code) != 3 or not code.isalpha():
             return False
 
+    # The rate must be a number above 0
     try:
         rate = float(record["rate"])
     except ValueError:
@@ -123,24 +137,32 @@ def validate_record(record):
     return True
 
 
+# 6. Clean the API data and build the data quality report
 def clean_records(data, selection, quote):
-    """Filter valid rows for one currency pair and return (DataFrame, report)."""
+    """Keep valid rows for one currency pair and return (DataFrame, report)."""
     columns = ["date", "base", "quote", "rate"]
 
+    # Count the missing values in each column before cleaning
     raw = pd.DataFrame(data, columns=columns)
     missing = raw.isna().sum()
 
+    # Keep the records that pass validate_record
     valid_rows = []
     for record in data:
         if validate_record(record):
             valid_rows.append(record)
 
     df = pd.DataFrame(valid_rows, columns=columns)
+
+    # Convert dates and rates to the right types
     df["date"] = pd.to_datetime(df["date"])
     df["rate"] = pd.to_numeric(df["rate"])
 
+    # Keep only the currency pair we asked for
     df = df[df["base"] == selection]
     df = df[df["quote"] == quote]
+
+    # Remove duplicate dates
     df = df.drop_duplicates(subset=["date"])
 
     report = {
@@ -157,12 +179,15 @@ def clean_records(data, selection, quote):
     return df, report
 
 
+# 7. Get the latest rate and the historical rates for one currency pair
 def get_rates(selection, quote, url, history_days):
-    """Fetch latest and historical rates, store in SQLite, and merge."""
+    """Return the latest rate, its date, the history table and two quality reports."""
+    # First API call: the latest rate
     params = {"base": selection, "quotes": quote}
     data = fetch_with_retry(url, params)
     df, latest_report = clean_records(data, selection, quote)
 
+    # "raise" stops the function and sends the error message to app.py
     if len(df) == 0:
         raise RateError(f"No valid latest rate for {selection} to {quote}.")
 
@@ -170,6 +195,7 @@ def get_rates(selection, quote, url, history_days):
     latest_rate = df["rate"].iloc[-1]
     latest_date = df["date"].iloc[-1]
 
+    # Second API call: the rates for the days before the latest rate
     start = latest_date - pd.Timedelta(days=history_days)
     end = latest_date - pd.Timedelta(days=1)
 
@@ -186,9 +212,12 @@ def get_rates(selection, quote, url, history_days):
     if len(df_history) < 2:
         raise RateError(f"Too little history for {selection} to {quote}.")
 
-    # Store history in SQLite and read back sorted by date
+    # Save the history in SQLite, then read it back with SQL
+    # Each pair gets its own table, for example rates_AED_GBP
     table = f"rates_{selection}_{quote}"
+
     connection = sqlite3.connect("exchange_rates.db")
+
     df_history.to_sql(table, connection, if_exists="replace", index=False)
 
     query = f"""
@@ -198,11 +227,13 @@ WHERE base = ? AND quote = ?
 ORDER BY date
 """
     history = pd.read_sql_query(query, connection, params=(selection, quote))
+
     connection.close()
 
     history["date"] = pd.to_datetime(history["date"])
 
-    # Merge latest rate onto historical rows
+    # C1: join the two API results with pd.merge on the currency pair,
+    # so every historical day sits next to today's rate
     latest = df[["base", "quote", "rate"]].tail(1)
     latest = latest.rename(columns={"rate": "latest_rate"})
 
@@ -214,7 +245,9 @@ ORDER BY date
     return latest_rate, latest_date, history, latest_report, history_report
 
 
+# 8. How much you get when you exchange money
 def calculate_exchange(amt, latest_rate, average_rate):
+    """Return the amount received at the latest and average rates, and the difference."""
     latest_total = amt * latest_rate
     average_total = amt * average_rate
     difference = latest_total - average_total
@@ -222,7 +255,9 @@ def calculate_exchange(amt, latest_rate, average_rate):
     return latest_total, average_total, difference
 
 
+# 9. How much an invoice costs you in your own currency
 def calculate_invoice(amt, latest_rate, average_rate):
+    """Return the invoice cost at the latest and average rates, and the savings."""
     latest_cost = amt / latest_rate
     average_cost = amt / average_rate
     savings = average_cost - latest_cost
@@ -230,7 +265,9 @@ def calculate_invoice(amt, latest_rate, average_rate):
     return latest_cost, average_cost, savings
 
 
+# 10. Compare the latest rate with the usual range
 def get_recommendation(latest_rate, lower, upper):
+    """Return Convert now, Wait if you can, or Neutral."""
     if latest_rate > upper:
         return "Convert now"
     elif latest_rate < lower:
@@ -239,7 +276,11 @@ def get_recommendation(latest_rate, lower, upper):
         return "Neutral"
 
 
+# 11. C4: two ways to set the usual range
+# Standard deviation: average +/- band_width x standard deviation
+# Percentile: for example the 10th and 90th percentile of past rates
 def get_limits(rates, method, band_width, percentile):
+    """Return the lower and upper limit of the usual range."""
     if method == "Percentile":
         lower = np.percentile(rates, percentile)
         upper = np.percentile(rates, 100 - percentile)
@@ -252,7 +293,10 @@ def get_limits(rates, method, band_width, percentile):
     return lower, upper
 
 
+# 12. All the numbers for one currency pair in one dictionary
+# (used by Analyze, Compare and the "use another currency" check)
 def summarize_pair(selection, quote, rate, date, history, settings):
+    """Return the statistics and the recommendation for one currency pair."""
     rates = history["rate"]
     average = np.mean(rates)
     std = np.std(rates)
@@ -277,7 +321,9 @@ def summarize_pair(selection, quote, rate, date, history, settings):
     }
 
 
+# 13. Give each currency a score based on improvement and stability
 def scale_to_unit(values):
+    """Scale a column of numbers to 0-1 (or 0.5 if every value is the same)."""
     low = np.min(values)
     high = np.max(values)
     if high == low:
@@ -286,10 +332,16 @@ def scale_to_unit(values):
 
 
 def rank_currencies(results, change_weight, stability_weight):
+    """Score and rank currencies using the weights from the settings."""
     comparison = pd.DataFrame(results)
 
+    # Change score: best improvement = 1, worst = 0
     comparison["Change score"] = scale_to_unit(comparison["Change (%)"])
+
+    # Stability score: least volatile = 1, most volatile = 0
     comparison["Stability score"] = 1 - scale_to_unit(comparison["Volatility (%)"])
+
+    # Final score uses the weights from Settings (for example 70% and 30%)
     comparison["Final score"] = (
         change_weight * comparison["Change score"]
         + stability_weight * comparison["Stability score"]
@@ -298,19 +350,28 @@ def rank_currencies(results, change_weight, stability_weight):
     return comparison.sort_values("Final score", ascending=False)
 
 
+# 14. C3: anomaly detection with the z-score
+# z-score = how many standard deviations a day is away from the average
 def find_anomalies(history):
+    """Add a z-score column to history and return the days where |z| > 2."""
     average = np.mean(history["rate"])
     std = np.std(history["rate"])
 
+    # If every rate is the same there is nothing unusual
     if std == 0:
         history["z-score"] = 0.0
     else:
         history["z-score"] = (history["rate"] - average) / std
 
-    return history[np.abs(history["z-score"]) > 2]
+    anomalies = history[np.abs(history["z-score"]) > 2]
+
+    return anomalies
 
 
+# 15. C5: what-if analysis
+# Count how many currencies pass "Convert now" for different band widths
 def what_if(comparison):
+    """Return a list of band widths and how many currencies pass at each one."""
     bands = np.arange(0, 2.25, 0.25)
     counts = []
 
@@ -322,7 +383,9 @@ def what_if(comparison):
     return bands, counts
 
 
+# 16. C10: write a Markdown summary of the saved results
 def build_report(records, comparison):
+    """Return a Markdown report of the saved analyses and the ranking."""
     lines = [
         "# Currency exchange report",
         "",
@@ -358,21 +421,28 @@ def build_report(records, comparison):
                 f"{row['Recommendation']}"
             )
 
+    # "\n".join puts every line on its own row in the file
     return "\n".join(lines)
 
 
-# Mock request functions for testing
+# 17. Fake request functions for the tests (mocks)
+# They act like requests.get, but fail on purpose
 def timeout_request(url, params, timeout):
+    """Pretend the API took too long."""
     raise requests.Timeout()
 
 
 def disconnected_request(url, params, timeout):
+    """Pretend the computer has no internet."""
     raise requests.ConnectionError()
 
 
+# 18. Tests: check that the calculations give the right answers
 def run_tests():
+    """Run all the checks and print PASS or FAIL for each one."""
     tests = {}
 
+    # Calculations
     latest, average, savings = calculate_invoice(100, 0.25, 0.20)
     tests["Invoice cost"] = (latest == 400)
     tests["Invoice savings"] = (savings == 100)
@@ -381,10 +451,12 @@ def run_tests():
     tests["Exchange amount"] = (latest == 25)
     tests["Exchange difference"] = (difference == 5)
 
+    # Recommendation rules
     tests["Above upper limit"] = (get_recommendation(11, 8, 10) == "Convert now")
     tests["Below lower limit"] = (get_recommendation(7, 8, 10) == "Wait if you can")
     tests["Exactly on limit"] = (get_recommendation(10, 8, 10) == "Neutral")
 
+    # validate_record
     record = {"date": "2026-01-10", "base": "AED", "quote": "GBP", "rate": 0.20}
     tests["Valid record accepted"] = validate_record(record)
 
@@ -397,6 +469,7 @@ def run_tests():
     record = {"date": "not a date", "base": "AED", "quote": "GBP", "rate": 0.20}
     tests["Bad date rejected"] = not validate_record(record)
 
+    # clean_records: 1 good row, 1 negative rate, 1 duplicate, 1 missing rate
     data = [
         {"date": "2026-01-10", "base": "AED", "quote": "GBP", "rate": 0.20},
         {"date": "2026-01-11", "base": "AED", "quote": "GBP", "rate": -1},
@@ -407,6 +480,7 @@ def run_tests():
     tests["Cleaning keeps only the good row"] = (len(df) == 1)
     tests["Missing rate is counted"] = (report["Missing rates"] == 1)
 
+    # C4: both ways of setting the range
     rates = pd.Series([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
     lower, upper = get_limits(rates, "Standard deviation", 1.0, 10)
     tests["Standard deviation range is centred on the average"] = (round(lower + upper, 6) == 11)
@@ -416,12 +490,14 @@ def run_tests():
         round(lower, 6) == 1.9 and round(upper, 6) == 9.1
     )
 
+    # C3: one clear outlier among 20 normal days
     history = pd.DataFrame({"rate": [1.0] * 10 + [1.01] * 10 + [2.0]})
     anomalies = find_anomalies(history)
     tests["Anomaly detection finds the outlier"] = (
         len(anomalies) == 1 and anomalies["rate"].iloc[0] == 2.0
     )
 
+    # C5: what-if counts can only go down as the band gets wider
     comparison = pd.DataFrame({
         "Latest": [1.10, 1.02, 0.95],
         "Average": [1.00, 1.00, 1.00],
@@ -430,12 +506,14 @@ def run_tests():
     bands, counts = what_if(comparison)
     tests["What-if: 2 pass at band 0, 0 pass at band 2"] = (counts[0] == 2 and counts[-1] == 0)
 
+    # Mocked API failures
     result = fetch_with_retry("test", {}, retries=1, get_request=timeout_request)
     tests["Timeout handled (mock)"] = (result == [])
 
     result = fetch_with_retry("test", {}, retries=1, get_request=disconnected_request)
     tests["Connection failure handled (mock)"] = (result == [])
 
+    # Custom exception: a broken URL gives no data, so get_rates must raise RateError
     print("(The next test retries a broken URL, so it takes a few seconds.)")
     try:
         get_rates("AED", "GBP", "http://localhost:1", 30)
@@ -443,7 +521,9 @@ def run_tests():
     except RateError:
         tests["RateError raised when there is no data"] = True
 
+    # Print the results
     passed = 0
+
     for name in tests:
         if tests[name]:
             print("PASS:", name)
@@ -454,5 +534,7 @@ def run_tests():
     print(passed, "out of", len(tests), "checks passed.")
 
 
+# Run the tests only when this file is run directly (py calculations.py),
+# not when app.py imports it
 if __name__ == "__main__":
     run_tests()
