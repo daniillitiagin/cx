@@ -23,6 +23,7 @@ from calculations import (
 )
 
 
+# Cache API rates for 1 hour (3600s) to avoid repeated calls and rate limits
 @st.cache_data(ttl=3600)
 def get_saved_rates(selection, quote, url, history_days):
     return get_rates(selection, quote, url, history_days)
@@ -66,6 +67,7 @@ def draw_distribution_chart(ax, history, latest_rate, selection, quote):
 settings = load_settings()
 currencies = settings["currencies"]
 
+# Keep saved analyses and ranking alive when switching sidebar pages
 if "history" not in st.session_state:
     st.session_state["history"] = []
 
