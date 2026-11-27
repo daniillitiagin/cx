@@ -1,0 +1,29 @@
+The request timed out.
+Could not get data from the API.
+(The next test retries a broken URL, so it takes a few seconds.)
+Could not get data from the API.
+Trying again in 1 second(s).
+Could not get data from the API.
+Trying again in 2 second(s).
+Could not get data from the API.
+PASS: Invoice cost
+PASS: Invoice savings
+PASS: Exchange amount
+PASS: Exchange difference
+PASS: Above upper limit
+PASS: Below lower limit
+PASS: Exactly on limit
+PASS: Valid record accepted
+PASS: Negative rate rejected
+PASS: Missing rate rejected
+PASS: Bad date rejected
+PASS: Cleaning keeps only the good row
+PASS: Missing rate is counted
+PASS: Standard deviation range is centred on the average
+PASS: Percentile range uses the 10th and 90th percentile
+PASS: Anomaly detection finds the outlier
+PASS: What-if: 2 pass at band 0, 0 pass at band 2
+PASS: Timeout handled (mock)
+PASS: Connection failure handled (mock)
+PASS: RateError raised when there is no data
+20 out of 20 checks passed.

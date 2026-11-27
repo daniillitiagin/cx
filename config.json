@@ -1,0 +1,17 @@
+{
+    "url": "https://api.frankfurter.dev/v2/rates",
+    "currencies": [
+        "GBP",
+        "USD",
+        "JPY",
+        "AED",
+        "CAD",
+        "EUR"
+    ],
+    "history_days": 30,
+    "band_width": 1.0,
+    "change_weight": 70,
+    "stability_weight": 30,
+    "range_method": "Standard deviation",
+    "percentile": 10
+}
